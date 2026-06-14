@@ -595,3 +595,160 @@ with col_dl2:
         st.download_button("Download spectral table (CSV)", csv_psd, "iid_spectral.csv", "text/csv")
 
 st.caption("IID Analyzer v1.0 | Rambam Epilepsy Unit | Herskovitz Lab")
+
+
+# ── IID Visual Validation ─────────────────────────────────────────────────────
+
+st.divider()
+st.subheader("🔍 IID Visual Validation")
+st.caption("בדוק כל התפרצות ויזואלית — גלול בין ה-IIDs וסמן כנכון/שגוי")
+
+if len(df_iid) == 0:
+    st.info("No IIDs to display.")
+else:
+    # Controls
+    col_v1, col_v2, col_v3 = st.columns([2, 2, 2])
+    with col_v1:
+        context_ms_viz = st.slider("Context around IID (ms)", 100, 1000, 300, 50,
+                                    key="viz_context")
+    with col_v2:
+        n_per_page = st.selectbox("IIDs per page", [5, 10, 20], index=1, key="viz_n")
+    with col_v3:
+        viz_channels = st.multiselect(
+            "Channels to display",
+            options=selected_chs,
+            default=selected_chs[:min(6, len(selected_chs))],
+            key="viz_chs",
+        )
+
+    if not viz_channels:
+        st.warning("בחר לפחות ערוץ אחד לתצוגה.")
+    else:
+        # Pagination
+        total_iids = len(df_iid)
+        n_pages = max(1, int(np.ceil(total_iids / n_per_page)))
+        page = st.number_input("עמוד", min_value=1, max_value=n_pages, value=1, step=1,
+                                key="viz_page")
+        st.caption(f"מציג IIDs {(page-1)*n_per_page+1}–{min(page*n_per_page, total_iids)} מתוך {total_iids}")
+
+        # Sort IIDs by time for display
+        iids_sorted = sorted(iids_raw, key=lambda x: x["onset_sec"])
+        page_iids = iids_sorted[(page-1)*n_per_page : page*n_per_page]
+
+        ctx_samps = int(context_ms_viz / 1000 * sfreq)
+        viz_ch_indices = [raw.ch_names.index(c) for c in viz_channels]
+
+        # Scale for display (µV)
+        scale = 1e6
+
+        for i, iid in enumerate(page_iids):
+            global_idx = (page-1)*n_per_page + i
+            iid_abs_sec = iid["onset_sec"]
+
+            # Sample indices in full recording
+            pk_samp  = int(iid_abs_sec * sfreq)
+            s_start  = max(0, pk_samp - ctx_samps)
+            s_end    = min(raw._data.shape[1], pk_samp + ctx_samps)
+
+            seg = raw._data[viz_ch_indices, s_start:s_end] * scale
+            t_axis = (np.arange(seg.shape[1]) - (pk_samp - s_start)) / sfreq * 1000  # ms
+
+            # Offset channels for butterfly display
+            spacing = np.percentile(np.abs(seg), 95) * 3 + 1
+            if spacing < 10:
+                spacing = 50.0
+
+            fig_v = go.Figure()
+            colors = px.colors.qualitative.Plotly
+
+            for ci, ch_name in enumerate(viz_channels):
+                offset = ci * spacing
+                fig_v.add_trace(go.Scatter(
+                    x=t_axis,
+                    y=seg[ci] + offset,
+                    mode="lines",
+                    name=ch_name,
+                    line=dict(color=colors[ci % len(colors)], width=1),
+                    hovertemplate=f"<b>{ch_name}</b><br>%{{x:.0f}} ms<br>%{{y:.1f}} µV<extra></extra>",
+                ))
+
+            # Mark IID onset
+            fig_v.add_vline(x=0, line_color="red", line_width=2,
+                            annotation_text="IID", annotation_position="top")
+            # Mark discharge end
+            dur_ms = iid["duration_ms"]
+            fig_v.add_vline(x=dur_ms, line_color="orange", line_dash="dash",
+                            line_width=1)
+            # Shade discharge window
+            fig_v.add_vrect(x0=0, x1=dur_ms,
+                            fillcolor="red", opacity=0.07, line_width=0)
+
+            t_rel_min = (iid_abs_sec - sz_onset) / 60
+            fig_v.update_layout(
+                title=dict(
+                    text=f"IID #{global_idx+1} | {iid_abs_sec:.1f}s ({t_rel_min:.1f} min before seizure) | "
+                         f"Duration: {dur_ms:.0f}ms | Z-score: {iid['peak_z']:.1f}",
+                    font=dict(size=12),
+                ),
+                height=200 + len(viz_channels) * 25,
+                margin=dict(t=40, b=20, l=60, r=20),
+                showlegend=True,
+                legend=dict(orientation="h", y=-0.25, font=dict(size=10)),
+                xaxis=dict(title="ms relative to IID onset", zeroline=True,
+                           zerolinecolor="red", zerolinewidth=1),
+                yaxis=dict(showticklabels=False, title="Channels (offset)"),
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+            )
+            fig_v.update_xaxes(gridcolor="#f0f0f0")
+
+            st.plotly_chart(fig_v, use_container_width=True, key=f"iid_viz_{global_idx}")
+
+            # Quick accept/reject buttons (stored in session state)
+            if f"iid_label_{global_idx}" not in st.session_state:
+                st.session_state[f"iid_label_{global_idx}"] = "unreviewed"
+
+            col_a, col_r, col_u, col_status = st.columns([1, 1, 1, 4])
+            with col_a:
+                if st.button("✅ אמיתי", key=f"accept_{global_idx}"):
+                    st.session_state[f"iid_label_{global_idx}"] = "accepted"
+            with col_r:
+                if st.button("❌ artifact", key=f"reject_{global_idx}"):
+                    st.session_state[f"iid_label_{global_idx}"] = "rejected"
+            with col_u:
+                if st.button("❓ לא ברור", key=f"unsure_{global_idx}"):
+                    st.session_state[f"iid_label_{global_idx}"] = "unsure"
+            with col_status:
+                label = st.session_state[f"iid_label_{global_idx}"]
+                color = {"accepted": "🟢", "rejected": "🔴", "unsure": "🟡", "unreviewed": "⚪"}
+                st.markdown(f"{color[label]} **{label}**")
+
+            st.divider()
+
+        # Summary of reviewed
+        all_labels = {i: st.session_state.get(f"iid_label_{i}", "unreviewed")
+                      for i in range(total_iids)}
+        n_accepted  = sum(1 for v in all_labels.values() if v == "accepted")
+        n_rejected  = sum(1 for v in all_labels.values() if v == "rejected")
+        n_unsure    = sum(1 for v in all_labels.values() if v == "unsure")
+        n_reviewed  = n_accepted + n_rejected + n_unsure
+
+        st.markdown(f"**סטטוס ביקורת:** ✅ {n_accepted} אמיתיים | ❌ {n_rejected} artifacts | "
+                    f"❓ {n_unsure} לא ברור | ⚪ {total_iids - n_reviewed} לא נבדקו")
+
+        if n_reviewed > 0:
+            precision = n_accepted / (n_accepted + n_rejected) * 100 if (n_accepted + n_rejected) > 0 else 0
+            st.metric("Precision (מתוך מה שנבדק)", f"{precision:.0f}%")
+
+            # Export with labels
+            labels_list = [all_labels.get(i, "unreviewed") for i in range(total_iids)]
+            df_iid_labeled = df_iid.copy()
+            df_iid_labeled["validation_label"] = labels_list
+            csv_labeled = df_iid_labeled.to_csv(index=False).encode()
+            st.download_button(
+                "💾 הורד IID table עם תוויות ביקורת",
+                csv_labeled,
+                "iid_validated.csv",
+                "text/csv",
+                key="dl_validated",
+            )

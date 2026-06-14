@@ -165,10 +165,15 @@ def detect_iids(
         if dur < min_samps or dur > max_samps:
             continue
 
-        seg = gfp_raw[on:off]
-        n_seg = len(seg)
+        # ── Welch PSD: extend segment with context for low-freq resolution ──
+        # Delta (1Hz) needs ≥2s for reliable PSD — add context around burst
+        min_welch_s = 2.0
+        ctx_needed  = max(0, int((min_welch_s * sfreq - dur) / 2))
+        seg_start   = max(0, on - ctx_needed)
+        seg_end     = min(len(gfp_raw), off + ctx_needed)
+        seg         = gfp_raw[seg_start:seg_end]
+        n_seg       = len(seg)
 
-        # ── Welch PSD: 2s window for good low-freq resolution ──
         nperseg = min(n_seg, max(64, int(2.0 * sfreq)))
         freqs, psd = signal.welch(seg, fs=sfreq, nperseg=nperseg,
                                    noverlap=nperseg // 2, scaling="density")

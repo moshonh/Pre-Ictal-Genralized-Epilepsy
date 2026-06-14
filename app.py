@@ -330,10 +330,13 @@ if not selected_chs:
     st.stop()
 
 
-# Extract data window
+# Extract data window directly (avoid deepcopy of cached resource)
 analysis_start = max(0, sz_onset - hours_before * 3600)
-raw_crop = raw.copy().crop(tmin=analysis_start, tmax=sz_onset - 0.1)
-data, times = raw_crop[selected_chs, :]
+start_samp = int(analysis_start * sfreq)
+end_samp   = int((sz_onset - 0.1) * sfreq)
+end_samp   = min(end_samp, raw._data.shape[1] - 1)
+ch_indices = [raw.ch_names.index(c) for c in selected_chs]
+data = raw._data[ch_indices, start_samp:end_samp]
 
 with st.spinner("Filtering & detecting IIDs…"):
     data_filt = bandpass(data, sfreq)

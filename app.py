@@ -151,14 +151,13 @@ def detect_iids(
     n = min(len(onsets), len(offsets))
     onsets, offsets = onsets[:n], offsets[:n]
 
-    # ── Spike (15-70Hz) and slow-wave (1-4Hz) filters ──
-    b_sp, a_sp = signal.butter(4, [15.0 / (sfreq / 2), 70.0 / (sfreq / 2)], btype="band")
-    b_sw, a_sw = signal.butter(4, [1.0  / (sfreq / 2), 4.0  / (sfreq / 2)], btype="band")
-    spike_band = signal.filtfilt(b_sp, a_sp, data_f, axis=-1)
-    slow_band  = signal.filtfilt(b_sw, a_sw, data_f, axis=-1)
-
     min_samps = int(300  / 1000 * sfreq)   # min burst 300ms
     max_samps = int(30.0 * sfreq)           # max burst 30s
+
+    _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    # Use RAW (unfiltered) data for PSD — bandpass would kill delta/slow-wave content
+    # GFP preserves generalized synchrony without cancellation artifacts of simple average
+    gfp_raw = np.sqrt(np.mean(data ** 2, axis=0))
 
     iids = []
     for on, off in zip(onsets, offsets):
@@ -166,11 +165,34 @@ def detect_iids(
         if dur < min_samps or dur > max_samps:
             continue
 
-        seg_sp = spike_band[:, on:off]
-        seg_sw = slow_band[:, on:off]
-        spike_power = float(np.mean(seg_sp ** 2))
-        slow_power  = float(np.mean(seg_sw ** 2))
-        ei_ratio    = spike_power / (slow_power + 1e-30)
+        seg = gfp_raw[on:off]
+        n_seg = len(seg)
+
+        # ── Welch PSD: 2s window for good low-freq resolution ──
+        nperseg = min(n_seg, max(64, int(2.0 * sfreq)))
+        freqs, psd = signal.welch(seg, fs=sfreq, nperseg=nperseg,
+                                   noverlap=nperseg // 2, scaling="density")
+
+        # ── Normalize by total power (relative PSD) ──
+        total_power = _trapz(psd, freqs) + 1e-30
+
+        def band_power(lo, hi):
+            mask = (freqs >= lo) & (freqs < hi)
+            return float(_trapz(psd[mask], freqs[mask]) / total_power)
+
+        # Excitatory: spike component (15–70 Hz)
+        excit = band_power(15, 70)
+        # Inhibitory: slow wave (1–4 Hz)
+        inhib = band_power(1, 4)
+        # E/I ratio (normalized — no band-width bias)
+        ei_ratio = excit / (inhib + 1e-30)
+
+        # Full spectral profile
+        delta  = band_power(1,  4)
+        theta  = band_power(4,  8)
+        alpha  = band_power(8,  13)
+        beta   = band_power(13, 30)
+        gamma  = band_power(30, 70)
 
         # Peak of GFP within burst
         pk = on + int(gfp[on:off].argmax())
@@ -183,9 +205,15 @@ def detect_iids(
             "duration_ms":   dur / sfreq * 1000,
             "peak_z":        float(gfp[pk] / (mad + 1e-30)),
             "peak_amp":      float(gfp[pk] * 1e6),
-            "spike_power":   spike_power,
-            "slow_power":    slow_power,
+            # Welch-based spectral measures
+            "spike_power":   excit,   # relative power 15-70Hz
+            "slow_power":    inhib,   # relative power 1-4Hz
             "ei_ratio":      ei_ratio,
+            "delta_rel":     delta,
+            "theta_rel":     theta,
+            "alpha_rel":     alpha,
+            "beta_rel":      beta,
+            "gamma_rel":     gamma,
         })
 
     return iids
@@ -749,18 +777,64 @@ else:
         )
         st.plotly_chart(fig_box_ei, use_container_width=True)
 
+    # ── Spectral profile across all bursts ──
+    spectral_cols = [c for c in ["delta_rel","theta_rel","alpha_rel","beta_rel","gamma_rel"]
+                     if c in df_iid.columns]
+    if spectral_cols:
+        st.markdown("#### 4 · Mean Spectral Profile of Bursts")
+        st.caption("Relative power per band (Welch PSD, normalized — no 1/f bias)")
+
+        band_labels = {"delta_rel":"δ (1-4Hz)","theta_rel":"θ (4-8Hz)",
+                       "alpha_rel":"α (8-13Hz)","beta_rel":"β (13-30Hz)","gamma_rel":"γ (30-70Hz)"}
+        means = {band_labels[c]: df_iid[c].mean() for c in spectral_cols}
+
+        fig_spec = go.Figure(go.Bar(
+            x=list(means.keys()),
+            y=list(means.values()),
+            marker_color=["#6366F1","#3B82F6","#10B981","#F59E0B","#EF4444"],
+            text=[f"{v:.1%}" for v in means.values()],
+            textposition="outside",
+        ))
+        fig_spec.update_layout(
+            yaxis_title="Relative power",
+            height=300, margin=dict(t=20,b=20),
+        )
+        st.plotly_chart(fig_spec, use_container_width=True)
+
+        # Spectral evolution toward seizure
+        st.markdown("#### 5 · Spectral Evolution Toward Seizure")
+        fig_spec_ev = go.Figure()
+        colors_sp = ["#6366F1","#3B82F6","#10B981","#F59E0B","#EF4444"]
+        for ci, (col, label) in enumerate(band_labels.items()):
+            if col not in df_iid.columns: continue
+            y_smooth = df_iid[col].rolling(3, min_periods=1).mean()
+            fig_spec_ev.add_trace(go.Scatter(
+                x=df_iid["t_rel_min"], y=y_smooth,
+                mode="lines+markers", name=label,
+                line=dict(color=colors_sp[ci], width=2),
+                marker=dict(size=5),
+            ))
+        fig_spec_ev.add_vline(x=0, line_color="red", line_dash="dot",
+                              annotation_text="Seizure")
+        fig_spec_ev.update_layout(
+            xaxis_title="Minutes relative to seizure",
+            yaxis_title="Relative power (3-burst rolling mean)",
+            height=350, margin=dict(t=20,b=20),
+        )
+        st.plotly_chart(fig_spec_ev, use_container_width=True)
+
     # ── Summary table ──
     st.markdown("#### Burst Summary Table")
     display_cols = ["t_rel_min", "duration_ms", "peak_z"]
     if has_ei:
         display_cols += ["ei_ratio", "spike_power", "slow_power"]
-    df_display = df_iid[display_cols].copy()
-    df_display["t_rel_min"] = df_display["t_rel_min"].round(2)
-    df_display["duration_ms"] = df_display["duration_ms"].round(0)
-    if has_ei:
-        df_display["ei_ratio"] = df_display["ei_ratio"].round(3)
-    df_display.columns = (["Min before seizure", "Duration (ms)", "GFP Z-score"] +
-                          (["E/I ratio", "Spike power", "Slow-wave power"] if has_ei else []))
+    spec_disp = [c for c in spectral_cols if c in df_iid.columns] if spectral_cols else []
+    display_cols += spec_disp
+    df_display = df_iid[display_cols].copy().round(3)
+    rename = {"t_rel_min":"Min before sz","duration_ms":"Duration (ms)","peak_z":"GFP Z",
+               "ei_ratio":"E/I ratio","spike_power":"Spike rel.power","slow_power":"SW rel.power",
+               "delta_rel":"δ","theta_rel":"θ","alpha_rel":"α","beta_rel":"β","gamma_rel":"γ"}
+    df_display = df_display.rename(columns=rename)
     st.dataframe(df_display, use_container_width=True, height=300)
 
 

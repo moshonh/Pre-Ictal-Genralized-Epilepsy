@@ -121,71 +121,83 @@ def detect_iids(
     refractory_ms: float = 500,
 ) -> list[dict]:
     """
-    Threshold-based IID detector for generalized epilepsy.
+    Spike-and-slow-wave detector for generalized epilepsy.
 
-    Strategy:
-    1. Global mean across channels (synchronous in generalized epilepsy)
-    2. High-pass filtered derivative to detect the sharp SPIKE component
-       (not the slow wave which has larger amplitude but slower rise)
-    3. Z-score peak detection on the derivative signal
-    4. Onset = first threshold crossing BEFORE the derivative peak (true spike onset)
-    5. Duration measured on the original signal envelope
+    Uses a two-stage approach validated for GTC/absence discharges:
+    1. Detect spike component: burst in 15-70 Hz band (Global Field Power)
+    2. Confirm slow wave: 1-4 Hz component follows within 50-600 ms
+    3. Onset = spike peak; duration spans to end of slow wave
     """
-    avg = np.mean(data, axis=0)
+    # ── Bandpass filtered average ──
+    b, a = signal.butter(4, [1.0 / (sfreq / 2), 70.0 / (sfreq / 2)], btype="band")
+    data_f = signal.filtfilt(b, a, data, axis=-1)
 
-    # ── Step 1: isolate spike component via high-pass (>8 Hz) ──
-    b_hp, a_hp = signal.butter(2, 8.0 / (sfreq / 2), btype='high')
-    hp = signal.filtfilt(b_hp, a_hp, avg)
+    # ── Spike envelope (15–70 Hz GFP) ──
+    b_sp, a_sp = signal.butter(4, [15.0 / (sfreq / 2), 70.0 / (sfreq / 2)], btype="band")
+    spike_band = signal.filtfilt(b_sp, a_sp, data_f, axis=-1)
+    spike_env  = np.sqrt(np.mean(spike_band ** 2, axis=0))
 
-    # ── Step 2: derivative (rate of change) to find sharp onset ──
-    deriv = np.abs(np.diff(hp, prepend=hp[0]))
+    # ── Slow wave envelope (1–4 Hz) ──
+    b_sw, a_sw = signal.butter(4, [1.0 / (sfreq / 2), 4.0 / (sfreq / 2)], btype="band")
+    slow_band  = signal.filtfilt(b_sw, a_sw, data_f, axis=-1)
+    slow_env   = np.abs(np.mean(slow_band, axis=0))
 
-    # ── Step 3: robust Z-score on derivative ──
-    med_d = np.median(deriv)
-    mad_d = np.median(np.abs(deriv - med_d)) + 1e-12
-    z_deriv = (deriv - med_d) / mad_d
+    # ── Thresholds (percentile-based, robust to recording length) ──
+    sp_thresh = np.percentile(spike_env, 100 - (100 / max(z_thresh, 1)))
+    sw_thresh = np.percentile(slow_env, 75)
 
-    # Also keep amplitude Z on abs signal for duration estimation
-    abs_sig = np.abs(avg)
-    med_a = np.median(abs_sig)
-    mad_a = np.median(np.abs(abs_sig - med_a)) + 1e-12
-    z_amp = (abs_sig - med_a) / mad_a
+    # ── Find spike peaks ──
+    min_dist = int(refractory_ms / 1000 * sfreq)
+    spike_peaks, _ = signal.find_peaks(spike_env, height=sp_thresh, distance=min_dist)
 
-    # ── Step 4: find peaks on derivative signal ──
-    min_distance = int(refractory_ms / 1000 * sfreq)
-    peaks, _ = signal.find_peaks(z_deriv, height=z_thresh, distance=min_distance)
-
-    iids = []
+    # ── Confirm each spike has a following slow wave ──
     min_samps = int(min_dur_ms / 1000 * sfreq)
     max_samps = int(max_dur_ms / 1000 * sfreq)
-    lookback  = int(0.02 * sfreq)  # max 20ms lookback for true spike onset
+    sw_min_lag = int(0.03 * sfreq)   # slow wave starts ≥30ms after spike
+    sw_max_lag = int(0.60 * sfreq)   # slow wave within 600ms
 
-    for pk in peaks:
-        # ── True spike onset: walk back to where derivative drops below 30% ──
-        thresh_back = z_deriv[pk] * 0.3
+    iids = []
+    for pk in spike_peaks:
+        sw_start = min(len(slow_env) - 1, pk + sw_min_lag)
+        sw_end   = min(len(slow_env),     pk + sw_max_lag)
+        if sw_end <= sw_start:
+            continue
+        sw_max_val = slow_env[sw_start:sw_end].max()
+        if sw_max_val < sw_thresh:
+            continue  # no slow wave → not a spike-wave discharge
+
+        # Duration: from spike onset to end of slow wave
+        sw_peak = sw_start + int(slow_env[sw_start:sw_end].argmax())
+        # Walk back to spike onset (where spike_env drops below 20% of peak)
         onset = pk
-        for s in range(pk, max(0, pk - lookback), -1):
-            if z_deriv[s] < thresh_back:
+        back_thresh = spike_env[pk] * 0.2
+        for s in range(pk, max(0, pk - int(0.05 * sfreq)), -1):
+            if spike_env[s] < back_thresh:
                 onset = s
                 break
+        # Walk forward to end of slow wave
+        fwd_thresh = sw_max_val * 0.2
+        offset = sw_peak
+        for s in range(sw_peak, min(len(slow_env) - 1, sw_peak + int(0.5 * sfreq))):
+            if slow_env[s] < fwd_thresh:
+                offset = s
+                break
 
-        # ── Duration: on amplitude signal, walk forward from onset ──
-        amp_thresh = max(z_amp[onset] * 0.3, 1.0)
-        right = onset
-        while right < len(z_amp) - 1 and z_amp[right] > amp_thresh:
-            right += 1
+        dur_samps = offset - onset
+        if dur_samps < min_samps:
+            dur_samps = min_samps
+        if dur_samps > max_samps * 3:  # allow spike-wave complexes up to ~750ms
+            dur_samps = max_samps
 
-        dur_samps = right - onset
-        if min_samps <= dur_samps <= max_samps:
-            iids.append({
-                "onset_sample":  onset,
-                "peak_sample":   pk,
-                "offset_sample": right,
-                "onset_sec":     onset / sfreq,
-                "duration_ms":   dur_samps / sfreq * 1000,
-                "peak_z":        float(z_deriv[pk]),
-                "peak_amp":      float(abs_sig[pk]),
-            })
+        iids.append({
+            "onset_sample":  onset,
+            "peak_sample":   pk,
+            "offset_sample": onset + dur_samps,
+            "onset_sec":     onset / sfreq,
+            "duration_ms":   dur_samps / sfreq * 1000,
+            "peak_z":        float(spike_env[pk] / (np.median(spike_env) + 1e-12)),
+            "peak_amp":      float(spike_env[pk]),
+        })
 
     return iids
 

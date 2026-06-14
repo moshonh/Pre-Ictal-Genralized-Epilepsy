@@ -197,12 +197,32 @@ def detect_iids(
         # Peak of GFP within burst
         pk = on + int(gfp[on:off].argmax())
 
+        # ── True onset: walk back from GFP threshold crossing ('on') using
+        #    the LOCAL MINIMUM GFP in the 500ms window before 'on' as reference.
+        #    This avoids contamination from other bursts in the baseline window.
+        #    Threshold = local_min * 1.5 (50% above local quiet level).
+        #    Max lookback = 200ms. ──
+        pre_start = max(0, on - int(0.5 * sfreq))
+        pre_end   = on
+        if pre_end > pre_start + 5:
+            local_min = float(np.percentile(gfp[pre_start:pre_end], 10))
+            bl_thresh = local_min * 2.0  # 2x local minimum
+        else:
+            bl_thresh = gfp[pk] * 0.15  # fallback
+
+        max_lookback = int(0.2 * sfreq)  # max 200ms lookback
+        true_onset = on
+        for s in range(on, max(0, on - max_lookback), -1):
+            if gfp[s] < bl_thresh:
+                true_onset = s
+                break
+
         iids.append({
-            "onset_sample":  int(on),
+            "onset_sample":  int(true_onset),
             "peak_sample":   int(pk),
             "offset_sample": int(off),
-            "onset_sec":     on / sfreq,
-            "duration_ms":   dur / sfreq * 1000,
+            "onset_sec":     true_onset / sfreq,
+            "duration_ms":   (off - true_onset) / sfreq * 1000,
             "peak_z":        float(gfp[pk] / (mad + 1e-30)),
             "peak_amp":      float(gfp[pk] * 1e6),
             # Welch-based spectral measures

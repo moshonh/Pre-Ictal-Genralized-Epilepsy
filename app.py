@@ -45,13 +45,62 @@ def load_edf(_file_bytes: bytes):
     return raw
 
 
-def get_seizure_onset(raw) -> float | None:
-    """Extract first seizure annotation (onset in seconds from recording start)."""
+def get_seizure_onset(raw, custom_keyword: str = "") -> float | None:
+    """
+    Extract seizure onset in seconds from recording start.
+    Handles both standard EDF+ (onset relative) and Natus/Xltek style
+    where onset=0 and the absolute time is encoded in orig_time.
+    """
+    import datetime
+
+    sz_keywords = ["seizure", "sz", "tc", "gtc", "ictal", "התקף"]
+    if custom_keyword:
+        sz_keywords = [custom_keyword.lower()]
+
+    rec_start = raw.info.get("meas_date", None)
+
+    candidates = []
     for ann in raw.annotations:
-        desc = ann["description"].lower()
-        if any(k in desc for k in ["seizure", "sz", "tc", "gtc", "onset", "התקף", "ictal"]):
-            return float(ann["onset"])
-    return None
+        desc = ann["description"].lower().strip()
+
+        if custom_keyword:
+            if custom_keyword.lower() not in desc:
+                continue
+        else:
+            is_sz = any(k in desc for k in sz_keywords)
+            is_onset = desc in ("onset", "seizure onset")
+            if not (is_sz or is_onset):
+                continue
+
+        onset_rel = float(ann["onset"])
+
+        # onset already relative to recording start
+        if onset_rel > 0.5:
+            candidates.append(onset_rel)
+            continue
+
+        # Natus/Xltek: onset=0, absolute time in orig_time
+        orig_time = ann.get("orig_time", None)
+        if orig_time is not None and rec_start is not None:
+            try:
+                if hasattr(orig_time, "tzinfo") and orig_time.tzinfo is None:
+                    orig_time = orig_time.replace(tzinfo=datetime.timezone.utc)
+                rs = rec_start
+                if hasattr(rs, "tzinfo") and rs.tzinfo is None:
+                    rs = rs.replace(tzinfo=datetime.timezone.utc)
+                delta = (orig_time - rs).total_seconds()
+                if delta >= 0:
+                    candidates.append(delta)
+                    continue
+            except Exception:
+                pass
+
+        candidates.append(onset_rel)
+
+    if not candidates:
+        return None
+
+    return max(candidates)
 
 
 def bandpass(data, sfreq, lo=1.0, hi=70.0, notch=50.0):
@@ -248,15 +297,8 @@ col1.metric("Sampling rate", f"{sfreq:.0f} Hz")
 col2.metric("Channels", len(ch_names))
 col3.metric("Recording duration", f"{duration_hrs:.1f} h")
 
-# Seizure onset
-if seizure_keyword:
-    sz_onset = None
-    for ann in raw.annotations:
-        if seizure_keyword.lower() in ann["description"].lower():
-            sz_onset = float(ann["onset"])
-            break
-else:
-    sz_onset = get_seizure_onset(raw)
+# Seizure onset — unified via get_seizure_onset (handles Natus orig_time style)
+sz_onset = get_seizure_onset(raw, custom_keyword=seizure_keyword)
 
 if sz_onset is None:
     st.error(

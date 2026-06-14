@@ -121,53 +121,70 @@ def detect_iids(
     refractory_ms: float = 500,
 ) -> list[dict]:
     """
-    Threshold-based IID detector on average-referenced generalized signal.
+    Threshold-based IID detector for generalized epilepsy.
 
     Strategy:
-    1. Compute global mean across channels (generalised epilepsy → synchronous)
-    2. Z-score the absolute signal
-    3. Peak-finding with refractory period
-    4. For each peak, extract discharge window and measure duration
+    1. Global mean across channels (synchronous in generalized epilepsy)
+    2. High-pass filtered derivative to detect the sharp SPIKE component
+       (not the slow wave which has larger amplitude but slower rise)
+    3. Z-score peak detection on the derivative signal
+    4. Onset = first threshold crossing BEFORE the derivative peak (true spike onset)
+    5. Duration measured on the original signal envelope
     """
-    # Average reference across channels
     avg = np.mean(data, axis=0)
 
-    # Absolute value envelope
+    # ── Step 1: isolate spike component via high-pass (>8 Hz) ──
+    b_hp, a_hp = signal.butter(2, 8.0 / (sfreq / 2), btype='high')
+    hp = signal.filtfilt(b_hp, a_hp, avg)
+
+    # ── Step 2: derivative (rate of change) to find sharp onset ──
+    deriv = np.abs(np.diff(hp, prepend=hp[0]))
+
+    # ── Step 3: robust Z-score on derivative ──
+    med_d = np.median(deriv)
+    mad_d = np.median(np.abs(deriv - med_d)) + 1e-12
+    z_deriv = (deriv - med_d) / mad_d
+
+    # Also keep amplitude Z on abs signal for duration estimation
     abs_sig = np.abs(avg)
+    med_a = np.median(abs_sig)
+    mad_a = np.median(np.abs(abs_sig - med_a)) + 1e-12
+    z_amp = (abs_sig - med_a) / mad_a
 
-    # Z-score (robust)
-    med = np.median(abs_sig)
-    mad = np.median(np.abs(abs_sig - med)) + 1e-12
-    z = (abs_sig - med) / mad
-
-    # Peak detection
+    # ── Step 4: find peaks on derivative signal ──
     min_distance = int(refractory_ms / 1000 * sfreq)
-    peaks, props = signal.find_peaks(z, height=z_thresh, distance=min_distance)
+    peaks, _ = signal.find_peaks(z_deriv, height=z_thresh, distance=min_distance)
 
     iids = []
     min_samps = int(min_dur_ms / 1000 * sfreq)
     max_samps = int(max_dur_ms / 1000 * sfreq)
+    lookback  = int(0.02 * sfreq)  # max 20ms lookback for true spike onset
 
     for pk in peaks:
-        # Find extent of discharge above half-max threshold
-        half = z[pk] * 0.3
-        left = pk
-        while left > 0 and z[left] > half:
-            left -= 1
-        right = pk
-        while right < len(z) - 1 and z[right] > half:
+        # ── True spike onset: walk back to where derivative drops below 30% ──
+        thresh_back = z_deriv[pk] * 0.3
+        onset = pk
+        for s in range(pk, max(0, pk - lookback), -1):
+            if z_deriv[s] < thresh_back:
+                onset = s
+                break
+
+        # ── Duration: on amplitude signal, walk forward from onset ──
+        amp_thresh = max(z_amp[onset] * 0.3, 1.0)
+        right = onset
+        while right < len(z_amp) - 1 and z_amp[right] > amp_thresh:
             right += 1
 
-        dur_samps = right - left
+        dur_samps = right - onset
         if min_samps <= dur_samps <= max_samps:
             iids.append({
-                "onset_sample": left,
-                "peak_sample": pk,
+                "onset_sample":  onset,
+                "peak_sample":   pk,
                 "offset_sample": right,
-                "onset_sec": left / sfreq,
-                "duration_ms": dur_samps / sfreq * 1000,
-                "peak_z": float(z[pk]),
-                "peak_amp": float(abs_sig[pk]),
+                "onset_sec":     onset / sfreq,
+                "duration_ms":   dur_samps / sfreq * 1000,
+                "peak_z":        float(z_deriv[pk]),
+                "peak_amp":      float(abs_sig[pk]),
             })
 
     return iids

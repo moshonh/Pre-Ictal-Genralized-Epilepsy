@@ -121,82 +121,71 @@ def detect_iids(
     refractory_ms: float = 500,
 ) -> list[dict]:
     """
-    Spike-and-slow-wave detector for generalized epilepsy.
+    Burst detector for generalized spike-wave discharges.
 
-    Uses a two-stage approach validated for GTC/absence discharges:
-    1. Detect spike component: burst in 15-70 Hz band (Global Field Power)
-    2. Confirm slow wave: 1-4 Hz component follows within 50-600 ms
-    3. Onset = spike peak; duration spans to end of slow wave
+    Detects the entire burst (onset → offset) using smoothed GFP envelope.
+    Each burst contains multiple spike-wave complexes.
+    Returns burst onset, duration, spike power, slow-wave power, and E/I ratio.
     """
-    # ── Bandpass filtered average ──
+    # ── Bandpass 1-70 Hz ──
     b, a = signal.butter(4, [1.0 / (sfreq / 2), 70.0 / (sfreq / 2)], btype="band")
     data_f = signal.filtfilt(b, a, data, axis=-1)
 
-    # ── Spike envelope (15–70 Hz GFP) ──
+    # ── Smoothed GFP (200ms window) ──
+    gfp = np.sqrt(np.mean(data_f ** 2, axis=0))
+    kernel = np.ones(int(0.2 * sfreq)) / int(0.2 * sfreq)
+    gfp_s  = np.convolve(gfp, kernel, mode="same")
+
+    # ── Threshold: median + z_thresh * MAD ──
+    med = np.median(gfp_s)
+    mad = np.median(np.abs(gfp_s - med)) + 1e-30
+    thresh = med + z_thresh * mad
+
+    # ── Binary burst mask → segments ──
+    mask = (gfp_s > thresh).astype(int)
+    diff = np.diff(mask)
+    onsets  = np.where(diff == 1)[0]
+    offsets = np.where(diff == -1)[0]
+    if len(offsets) and len(onsets) and offsets[0] < onsets[0]:
+        offsets = offsets[1:]
+    n = min(len(onsets), len(offsets))
+    onsets, offsets = onsets[:n], offsets[:n]
+
+    # ── Spike (15-70Hz) and slow-wave (1-4Hz) filters ──
     b_sp, a_sp = signal.butter(4, [15.0 / (sfreq / 2), 70.0 / (sfreq / 2)], btype="band")
+    b_sw, a_sw = signal.butter(4, [1.0  / (sfreq / 2), 4.0  / (sfreq / 2)], btype="band")
     spike_band = signal.filtfilt(b_sp, a_sp, data_f, axis=-1)
-    spike_env  = np.sqrt(np.mean(spike_band ** 2, axis=0))
-
-    # ── Slow wave envelope (1–4 Hz) ──
-    b_sw, a_sw = signal.butter(4, [1.0 / (sfreq / 2), 4.0 / (sfreq / 2)], btype="band")
     slow_band  = signal.filtfilt(b_sw, a_sw, data_f, axis=-1)
-    slow_env   = np.abs(np.mean(slow_band, axis=0))
 
-    # ── Thresholds (percentile-based, robust to recording length) ──
-    sp_thresh = np.percentile(spike_env, 100 - (100 / max(z_thresh, 1)))
-    sw_thresh = np.percentile(slow_env, 75)
-
-    # ── Find spike peaks ──
-    min_dist = int(refractory_ms / 1000 * sfreq)
-    spike_peaks, _ = signal.find_peaks(spike_env, height=sp_thresh, distance=min_dist)
-
-    # ── Confirm each spike has a following slow wave ──
-    min_samps = int(min_dur_ms / 1000 * sfreq)
-    max_samps = int(max_dur_ms / 1000 * sfreq)
-    sw_min_lag = int(0.03 * sfreq)   # slow wave starts ≥30ms after spike
-    sw_max_lag = int(0.60 * sfreq)   # slow wave within 600ms
+    min_samps = int(300  / 1000 * sfreq)   # min burst 300ms
+    max_samps = int(30.0 * sfreq)           # max burst 30s
 
     iids = []
-    for pk in spike_peaks:
-        sw_start = min(len(slow_env) - 1, pk + sw_min_lag)
-        sw_end   = min(len(slow_env),     pk + sw_max_lag)
-        if sw_end <= sw_start:
+    for on, off in zip(onsets, offsets):
+        dur = off - on
+        if dur < min_samps or dur > max_samps:
             continue
-        sw_max_val = slow_env[sw_start:sw_end].max()
-        if sw_max_val < sw_thresh:
-            continue  # no slow wave → not a spike-wave discharge
 
-        # Duration: from spike onset to end of slow wave
-        sw_peak = sw_start + int(slow_env[sw_start:sw_end].argmax())
-        # Walk back to spike onset (where spike_env drops below 20% of peak)
-        onset = pk
-        back_thresh = spike_env[pk] * 0.2
-        for s in range(pk, max(0, pk - int(0.05 * sfreq)), -1):
-            if spike_env[s] < back_thresh:
-                onset = s
-                break
-        # Walk forward to end of slow wave
-        fwd_thresh = sw_max_val * 0.2
-        offset = sw_peak
-        for s in range(sw_peak, min(len(slow_env) - 1, sw_peak + int(0.5 * sfreq))):
-            if slow_env[s] < fwd_thresh:
-                offset = s
-                break
+        seg_sp = spike_band[:, on:off]
+        seg_sw = slow_band[:, on:off]
+        spike_power = float(np.mean(seg_sp ** 2))
+        slow_power  = float(np.mean(seg_sw ** 2))
+        ei_ratio    = spike_power / (slow_power + 1e-30)
 
-        dur_samps = offset - onset
-        if dur_samps < min_samps:
-            dur_samps = min_samps
-        if dur_samps > max_samps * 3:  # allow spike-wave complexes up to ~750ms
-            dur_samps = max_samps
+        # Peak of GFP within burst
+        pk = on + int(gfp[on:off].argmax())
 
         iids.append({
-            "onset_sample":  onset,
-            "peak_sample":   pk,
-            "offset_sample": onset + dur_samps,
-            "onset_sec":     onset / sfreq,
-            "duration_ms":   dur_samps / sfreq * 1000,
-            "peak_z":        float(spike_env[pk] / (np.median(spike_env) + 1e-12)),
-            "peak_amp":      float(spike_env[pk]),
+            "onset_sample":  int(on),
+            "peak_sample":   int(pk),
+            "offset_sample": int(off),
+            "onset_sec":     on / sfreq,
+            "duration_ms":   dur / sfreq * 1000,
+            "peak_z":        float(gfp[pk] / (mad + 1e-30)),
+            "peak_amp":      float(gfp[pk] * 1e6),
+            "spike_power":   spike_power,
+            "slow_power":    slow_power,
+            "ei_ratio":      ei_ratio,
         })
 
     return iids
@@ -599,6 +588,180 @@ if not df_psd.empty:
         margin=dict(t=20, b=20),
     )
     st.plotly_chart(fig_heat, use_container_width=True)
+
+
+
+
+# ── Research Analysis: Burst Rate / Duration / E/I Ratio ─────────────────────
+
+st.divider()
+st.subheader("🔬 Pre-ictal Burst Analysis")
+st.caption("שלושת המרכיבים המחקריים: תדירות · משך · יחס עירור/עיכוב")
+
+if len(df_iid) < 3:
+    st.warning("Not enough bursts detected for trend analysis. Try lowering the Z-score threshold.")
+else:
+    # ── Add E/I columns if present ──
+    has_ei = "ei_ratio" in df_iid.columns
+
+    # ── Time axis: minutes before seizure ──
+    df_iid["t_rel_min"] = (df_iid["onset_sec"] - sz_onset) / 60
+
+    # ── Bin into 1-minute windows ──
+    df_iid["min_bin"] = df_iid["t_rel_min"].apply(lambda t: int(np.floor(t)))
+    min_bins = sorted(df_iid["min_bin"].unique())
+
+    bin_stats = []
+    for mb in min_bins:
+        sub = df_iid[df_iid["min_bin"] == mb]
+        row = {
+            "min_before_sz": -mb,
+            "t_rel_min": mb,
+            "burst_count": len(sub),
+            "mean_dur_s": sub["duration_ms"].mean() / 1000,
+        }
+        if has_ei:
+            row["mean_ei"] = sub["ei_ratio"].median()
+        bin_stats.append(row)
+
+    df_bins = pd.DataFrame(bin_stats).sort_values("t_rel_min")
+
+    from scipy.stats import linregress
+
+    # ── Plot 1: Burst Rate ──
+    st.markdown("#### 1 · Burst Rate (bursts/min)")
+    slope_r, _, r_r, p_r, _ = linregress(df_bins["t_rel_min"], df_bins["burst_count"])
+    trend_r = ("↑ Increasing" if slope_r < 0 and p_r < 0.1 else
+               "↓ Decreasing" if slope_r > 0 and p_r < 0.1 else "No clear trend")
+    st.markdown(f"**Trend toward seizure:** {trend_r} &nbsp;|&nbsp; r={r_r:.2f} &nbsp;|&nbsp; p={p_r:.3f}",
+                unsafe_allow_html=True)
+
+    fig_rate = go.Figure()
+    fig_rate.add_trace(go.Bar(
+        x=df_bins["t_rel_min"],
+        y=df_bins["burst_count"],
+        marker_color="#3B82F6",
+        name="Bursts/min",
+    ))
+    # Trend line
+    x_line = np.array([df_bins["t_rel_min"].min(), df_bins["t_rel_min"].max()])
+    y_line = slope_r * x_line + _
+    fig_rate.add_trace(go.Scatter(
+        x=x_line, y=y_line, mode="lines",
+        line=dict(color="red", dash="dash", width=2), name="Trend",
+    ))
+    fig_rate.add_vline(x=0, line_color="red", line_dash="dot", annotation_text="Seizure")
+    fig_rate.update_layout(
+        xaxis_title="Minutes relative to seizure onset",
+        yaxis_title="Burst count per minute",
+        height=300, margin=dict(t=20, b=20), showlegend=False,
+    )
+    st.plotly_chart(fig_rate, use_container_width=True)
+
+    # ── Plot 2: Burst Duration ──
+    st.markdown("#### 2 · Burst Duration (seconds)")
+    slope_d, intercept_d, r_d, p_d, _ = linregress(df_iid["t_rel_min"], df_iid["duration_ms"] / 1000)
+    trend_d = ("↑ Lengthening" if slope_d < 0 and p_d < 0.1 else
+               "↓ Shortening"  if slope_d > 0 and p_d < 0.1 else "No clear trend")
+    st.markdown(f"**Trend toward seizure:** {trend_d} &nbsp;|&nbsp; r={r_d:.2f} &nbsp;|&nbsp; p={p_d:.3f}",
+                unsafe_allow_html=True)
+
+    fig_dur = go.Figure()
+    fig_dur.add_trace(go.Scatter(
+        x=df_iid["t_rel_min"],
+        y=df_iid["duration_ms"] / 1000,
+        mode="markers",
+        marker=dict(color="#10B981", size=6, opacity=0.6),
+        name="Burst duration",
+    ))
+    x_line2 = np.array([df_iid["t_rel_min"].min(), df_iid["t_rel_min"].max()])
+    fig_dur.add_trace(go.Scatter(
+        x=x_line2, y=slope_d * x_line2 + intercept_d, mode="lines",
+        line=dict(color="red", dash="dash", width=2), name="Trend",
+    ))
+    fig_dur.add_vline(x=0, line_color="red", line_dash="dot", annotation_text="Seizure")
+    fig_dur.update_layout(
+        xaxis_title="Minutes relative to seizure onset",
+        yaxis_title="Burst duration (s)",
+        height=300, margin=dict(t=20, b=20), showlegend=False,
+    )
+    st.plotly_chart(fig_dur, use_container_width=True)
+
+    # ── Plot 3: E/I Ratio ──
+    if has_ei:
+        st.markdown("#### 3 · E/I Ratio (spike power / slow-wave power)")
+        st.caption("גבוה = דומיננטיות עירור | נמוך = דומיננטיות עיכוב")
+
+        slope_ei, intercept_ei, r_ei, p_ei, _ = linregress(df_iid["t_rel_min"], df_iid["ei_ratio"])
+        trend_ei = ("↑ More excitation" if slope_ei < 0 and p_ei < 0.1 else
+                    "↓ More inhibition" if slope_ei > 0 and p_ei < 0.1 else "No clear trend")
+        st.markdown(f"**Trend toward seizure:** {trend_ei} &nbsp;|&nbsp; r={r_ei:.2f} &nbsp;|&nbsp; p={p_ei:.3f}",
+                    unsafe_allow_html=True)
+
+        fig_ei = go.Figure()
+        fig_ei.add_trace(go.Scatter(
+            x=df_iid["t_rel_min"],
+            y=df_iid["ei_ratio"],
+            mode="markers",
+            marker=dict(
+                color=df_iid["ei_ratio"],
+                colorscale="RdBu_r",
+                size=7,
+                opacity=0.7,
+                colorbar=dict(title="E/I ratio"),
+                showscale=True,
+            ),
+            name="E/I ratio",
+        ))
+        x_line3 = np.array([df_iid["t_rel_min"].min(), df_iid["t_rel_min"].max()])
+        fig_ei.add_trace(go.Scatter(
+            x=x_line3, y=slope_ei * x_line3 + intercept_ei, mode="lines",
+            line=dict(color="black", dash="dash", width=2), name="Trend",
+        ))
+        fig_ei.add_vline(x=0, line_color="red", line_dash="dot", annotation_text="Seizure")
+        fig_ei.add_hline(y=1.0, line_color="gray", line_dash="dot",
+                         annotation_text="E=I", annotation_position="right")
+        fig_ei.update_layout(
+            xaxis_title="Minutes relative to seizure onset",
+            yaxis_title="E/I ratio",
+            height=320, margin=dict(t=20, b=20), showlegend=False,
+        )
+        st.plotly_chart(fig_ei, use_container_width=True)
+
+        # ── Per-burst E/I boxplot by 3-minute windows ──
+        st.markdown("#### E/I Ratio Distribution by Time Window")
+        df_iid["window"] = df_iid["t_rel_min"].apply(
+            lambda t: f"{int(np.floor(t/3))*3} to {int(np.floor(t/3))*3+3} min"
+        )
+        windows_sorted = sorted(df_iid["window"].unique(),
+                                key=lambda w: int(w.split(" ")[0]))
+        fig_box_ei = go.Figure()
+        for w in windows_sorted:
+            vals = df_iid.loc[df_iid["window"]==w, "ei_ratio"].values
+            fig_box_ei.add_trace(go.Box(
+                y=vals, name=w, boxmean=True,
+                marker_color="#6366F1",
+            ))
+        fig_box_ei.update_layout(
+            xaxis_title="Time window (min before seizure)",
+            yaxis_title="E/I ratio",
+            showlegend=False, height=320, margin=dict(t=20, b=20),
+        )
+        st.plotly_chart(fig_box_ei, use_container_width=True)
+
+    # ── Summary table ──
+    st.markdown("#### Burst Summary Table")
+    display_cols = ["t_rel_min", "duration_ms", "peak_z"]
+    if has_ei:
+        display_cols += ["ei_ratio", "spike_power", "slow_power"]
+    df_display = df_iid[display_cols].copy()
+    df_display["t_rel_min"] = df_display["t_rel_min"].round(2)
+    df_display["duration_ms"] = df_display["duration_ms"].round(0)
+    if has_ei:
+        df_display["ei_ratio"] = df_display["ei_ratio"].round(3)
+    df_display.columns = (["Min before seizure", "Duration (ms)", "GFP Z-score"] +
+                          (["E/I ratio", "Spike power", "Slow-wave power"] if has_ei else []))
+    st.dataframe(df_display, use_container_width=True, height=300)
 
 
 # ── Annotation inspector ──────────────────────────────────────────────────────

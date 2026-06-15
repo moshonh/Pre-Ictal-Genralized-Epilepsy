@@ -38,8 +38,10 @@ st.markdown("""
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner=False)
-def load_edf(_file_bytes: bytes):
-    """Load EDF from bytes, return raw MNE object."""
+def load_edf(_file_bytes: bytes, _file_name: str = ""):
+    """Load EDF from bytes, return raw MNE object.
+    _file_name is used as cache key so different files are not confused.
+    """
     with io.BytesIO(_file_bytes) as buf:
         raw = mne.io.read_raw_edf(buf, preload=True, verbose=False)
     return raw
@@ -357,7 +359,7 @@ if uploaded is None:
 
 with st.spinner("Loading EDF file…"):
     file_bytes = uploaded.read()
-    raw = load_edf(file_bytes)
+    raw = load_edf(file_bytes, _file_name=uploaded.name)
 
 sfreq = raw.info["sfreq"]
 ch_names = raw.ch_names

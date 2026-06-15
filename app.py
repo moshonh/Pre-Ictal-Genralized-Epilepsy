@@ -357,6 +357,11 @@ if uploaded is None:
 
 # ── Load & process ────────────────────────────────────────────────────────────
 
+# Clear cache button
+if st.sidebar.button("🔄 Clear cache & reload"):
+    load_edf.clear()
+    st.rerun()
+
 with st.spinner("Loading EDF file…"):
     file_bytes = uploaded.read()
     raw = load_edf(file_bytes, _file_name=uploaded.name)
